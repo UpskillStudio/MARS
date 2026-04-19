@@ -29,7 +29,7 @@ def _init():
             "LANGFUSE_HOST",
             os.getenv("LANGFUSE_HOST", "https://cloud.langfuse.com"),
         )
-        from langfuse.decorators import langfuse_context  # noqa: F401 — verify importable
+        from langfuse import observe  # noqa: F401 — verify importable
         _enabled = True
         print("[Observability] Langfuse v4 enabled")
     except Exception as e:
@@ -48,7 +48,7 @@ def observe_span(name: str):
         if not _enabled:
             return fn
         try:
-            from langfuse.decorators import observe
+            from langfuse import observe
 
             @observe(name=name)
             @wraps(fn)
@@ -71,9 +71,9 @@ def observe_trace(name: str):
         if not _enabled:
             return fn
         try:
-            from langfuse.decorators import observe
+            from langfuse import observe
 
-            @observe(name=name, as_type="trace")
+            @observe(name=name)
             @wraps(fn)
             async def wrapper(*args, **kwargs):
                 return await fn(*args, **kwargs)
@@ -90,7 +90,7 @@ def flush():
     if not _enabled:
         return
     try:
-        from langfuse.decorators import langfuse_context
-        langfuse_context.flush()
+        from langfuse import get_client
+        get_client().flush()
     except Exception:
         pass
