@@ -1,8 +1,10 @@
 import asyncio
 import json
+import os
 from pathlib import Path
 
 import anthropic
+from tavily import TavilyClient
 
 from mars.models import (
     DocFinding, ErrorResult, Finding, ResearchManifest,
@@ -13,6 +15,15 @@ from mars.agents import doc_analysis as doc_analysis_agent
 from mars.agents import synthesis as synthesis_agent
 from mars.agents import report_gen as report_gen_agent
 from mars.tools import document as doc_tool
+from mars.observability import observe_span, observe_trace, flush
+
+_tavily_client: TavilyClient | None = None
+
+def _tavily() -> TavilyClient:
+    global _tavily_client
+    if _tavily_client is None:
+        _tavily_client = TavilyClient(api_key=os.environ["TAVILY_API_KEY"])
+    return _tavily_client
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -61,20 +72,36 @@ Assign non-overlapping scope boundaries to prevent duplicate findings across sub
 # ---------------------------------------------------------------------------
 
 class Coordinator:
-    def __init__(self, max_concurrency: int = 1) -> None:
+    def __init__(
+        self,
+        max_concurrency: int = 1,
+        adaptive_search: bool = False,
+        max_domains: int = 0,
+    ) -> None:
         """
         Args:
-            max_concurrency: Max parallel subagent calls. Default 1 (sequential) is safe for
-                             free-tier accounts (50k input tokens/min). Increase with higher tiers.
+            max_concurrency: Max parallel subagent calls. Default 1 (sequential).
+            adaptive_search: If True, use ReAct loop (Claude decides search strategy).
+                             If False (default), call Tavily directly — no Haiku calls.
+            max_domains: Cap sub-domains to this number (0 = no cap). Use 2-3 for test runs.
         """
         self._client = anthropic.AsyncAnthropic()
         self._max_concurrency = max_concurrency
+        self._adaptive_search = adaptive_search
+        self._max_domains = max_domains
 
+    @observe_trace("mars-run")
     async def run(self, topic: str, doc_paths: list[str] = []) -> str:
         print(f"\n[Coordinator] Topic: {topic}")
 
+        mode = "adaptive (ReAct)" if self._adaptive_search else "direct (Tavily)"
+        print(f"[Coordinator] Search mode: {mode}")
+
         # Phase 1 — Decompose
         sub_domains = await self._decompose(topic)
+        if self._max_domains:
+            sub_domains = sub_domains[: self._max_domains]
+
         print(f"[Coordinator] Sub-domains ({len(sub_domains)}):")
         for sd in sub_domains:
             print(f"  - {sd['name']}")
@@ -84,31 +111,30 @@ class Coordinator:
             sub_domains=[SubDomainStatus(name=sd["name"]) for sd in sub_domains],
         )
 
-        # Phase 2 — Load documents (Phase 3 capability)
+        # Phase 2 — Load documents
         doc_store = self._load_documents(doc_paths)
         if doc_store:
             doc_tool.register(doc_store)
 
-        # Phase 3 — Initial parallel research
+        # Phase 3 — Initial research
         sd_findings, sd_doc_findings = await self._run_initial_research(
             topic, sub_domains, doc_store
         )
         manifest = self._update_manifest(manifest, sd_findings, sd_doc_findings)
-
         total = sum(len(v) for v in sd_findings.values())
         doc_total = sum(len(v) for v in sd_doc_findings.values())
         print(f"\n[Coordinator] Findings: {total} web, {doc_total} doc")
 
-        # Phase 6 — Iterative gap-filling refinement
+        # Phase 6 — Refinement
         sd_findings = await self._refine(topic, manifest, sd_findings)
         manifest = self._update_manifest(manifest, sd_findings, sd_doc_findings)
 
         # Phase 4 — Synthesis
         print("\n[Coordinator] Running synthesis...")
         synthesis = await self._synthesize(topic, sub_domains, sd_findings, sd_doc_findings)
-
         if isinstance(synthesis, ErrorResult):
-            print(f"  [Synthesis] ERROR: {synthesis.message} — falling back to basic report")
+            print(f"  [Synthesis] ERROR: {synthesis.message} — falling back")
+            flush()
             return self._fallback_report(topic, sub_domains, sd_findings)
 
         print(f"  [Synthesis] {len(synthesis.themes)} themes, {len(synthesis.conflicts)} conflicts, {len(synthesis.gaps)} gaps")
@@ -116,17 +142,81 @@ class Coordinator:
         # Phase 5 — Report generation
         print("\n[Coordinator] Generating report...")
         report = await self._generate_report(topic, synthesis)
-
         if isinstance(report, ErrorResult):
-            print(f"  [ReportGen] ERROR: {report.message} — falling back to basic report")
+            print(f"  [ReportGen] ERROR: {report.message} — falling back")
+            flush()
             return self._fallback_report(topic, sub_domains, sd_findings)
 
+        flush()
         return report
+
+    # -----------------------------------------------------------------------
+    # Search modes
+    # -----------------------------------------------------------------------
+
+    async def _direct_web_search(
+        self, topic: str, sub_domains: list[dict]
+    ) -> dict[str, list[Finding]]:
+        """Call Tavily directly — no Claude Haiku, no ReAct loop."""
+        print(f"\n[Coordinator] Direct Tavily search across {len(sub_domains)} sub-domains...")
+        sd_findings: dict[str, list[Finding]] = {}
+        for sd in sub_domains:
+            name = sd["name"]
+            try:
+                response = _tavily().search(query=sd["search_query"], max_results=5)
+                findings = [
+                    Finding(
+                        claim=r.get("title", ""),
+                        evidence_excerpt=r.get("content", ""),
+                        source_url=r.get("url", ""),
+                        publication_date=r.get("published_date", ""),
+                        relevance_score=r.get("score", 0.5),
+                    )
+                    for r in response.get("results", [])
+                    if r.get("url")
+                ]
+                sd_findings[name] = findings
+                print(f"  [{name}] {len(findings)} findings")
+            except Exception as e:
+                print(f"  [{name}] Tavily error: {e}")
+                sd_findings[name] = []
+        return sd_findings
+
+    async def _adaptive_web_search(
+        self, topic: str, sub_domains: list[dict]
+    ) -> dict[str, list[Finding]]:
+        """ReAct loop — Claude Haiku decides search strategy adaptively."""
+        sem = asyncio.Semaphore(self._max_concurrency)
+
+        async def _web(sd: dict):
+            async with sem:
+                return sd["name"], await web_search_agent.run(
+                    self._build_search_prompt(topic, sd)
+                )
+
+        print(f"\n[Coordinator] Adaptive search: {len(sub_domains)} agents (max {self._max_concurrency} concurrent)...")
+        results = await asyncio.gather(*[_web(sd) for sd in sub_domains], return_exceptions=True)
+
+        sd_findings: dict[str, list[Finding]] = {}
+        for item in results:
+            if isinstance(item, Exception):
+                print(f"  [WebSearch] EXCEPTION: {item}")
+                continue
+            name, result = item
+            if isinstance(result, list):
+                findings = [f for f in result if isinstance(f, Finding)]
+                sd_findings[name] = findings
+                print(f"  [{name}] {len(findings)} findings")
+            elif isinstance(result, ErrorResult):
+                print(f"  [{name}] ERROR: {result.message}")
+                sd_findings[name] = []
+        return sd_findings
 
     # -----------------------------------------------------------------------
     # Phase: Decompose
     # -----------------------------------------------------------------------
 
+    @observe_span("decompose")
     async def _decompose(self, topic: str) -> list[dict]:
         response = await self._client.messages.create(
             model="claude-sonnet-4-6",
@@ -145,33 +235,14 @@ class Coordinator:
     # Phase: Initial research (web + doc in parallel)
     # -----------------------------------------------------------------------
 
+    @observe_span("research")
     async def _run_initial_research(
         self, topic: str, sub_domains: list[dict], doc_store: dict
     ) -> tuple[dict[str, list[Finding]], dict[str, list[DocFinding]]]:
-        sem = asyncio.Semaphore(self._max_concurrency)
-
-        async def _web(sd: dict):
-            async with sem:
-                return sd["name"], await web_search_agent.run(
-                    self._build_search_prompt(topic, sd)
-                )
-
-        print(f"\n[Coordinator] Spawning {len(sub_domains)} WebSearch agents (max {self._max_concurrency} concurrent)...")
-        web_results = await asyncio.gather(*[_web(sd) for sd in sub_domains], return_exceptions=True)
-
-        sd_findings: dict[str, list[Finding]] = {}
-        for item in web_results:
-            if isinstance(item, Exception):
-                print(f"  [WebSearch] EXCEPTION: {item}")
-                continue
-            name, result = item
-            if isinstance(result, list):
-                findings = [f for f in result if isinstance(f, Finding)]
-                sd_findings[name] = findings
-                print(f"  [{name}] {len(findings)} web findings")
-            elif isinstance(result, ErrorResult):
-                print(f"  [{name}] ERROR: {result.message}")
-                sd_findings[name] = []
+        if self._adaptive_search:
+            sd_findings = await self._adaptive_web_search(topic, sub_domains)
+        else:
+            sd_findings = await self._direct_web_search(topic, sub_domains)
 
         sd_doc_findings: dict[str, list[DocFinding]] = {}
         if doc_store:
@@ -192,6 +263,7 @@ class Coordinator:
     # Phase 6: Iterative refinement
     # -----------------------------------------------------------------------
 
+    @observe_span("refinement")
     async def _refine(
         self, topic: str, manifest: ResearchManifest, sd_findings: dict[str, list[Finding]]
     ) -> dict[str, list[Finding]]:
@@ -235,6 +307,7 @@ class Coordinator:
     # Phase 4: Synthesis
     # -----------------------------------------------------------------------
 
+    @observe_span("synthesis")
     async def _synthesize(
         self,
         topic: str,
@@ -274,6 +347,7 @@ class Coordinator:
     # Phase 5: Report generation
     # -----------------------------------------------------------------------
 
+    @observe_span("report_gen")
     async def _generate_report(self, topic: str, synthesis: SynthesisOutput) -> str | ErrorResult:
         # Build numbered citation list for inline references
         all_citations = synthesis.citations[:]

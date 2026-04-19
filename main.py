@@ -28,6 +28,18 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="Max parallel subagent calls (default: 1). Increase for higher API rate limit tiers.",
     )
+    parser.add_argument(
+        "--adaptive",
+        action="store_true",
+        default=False,
+        help="Enable adaptive ReAct search loop (higher quality, higher cost). Default: direct Tavily search.",
+    )
+    parser.add_argument(
+        "--max-domains",
+        type=int,
+        default=0,
+        help="Cap number of sub-domains (0 = no cap). Use 2-3 for cheap test runs.",
+    )
     return parser.parse_args()
 
 
@@ -36,7 +48,11 @@ async def main() -> None:
 
     from mars.coordinator import Coordinator
 
-    coordinator = Coordinator(max_concurrency=args.concurrency)
+    coordinator = Coordinator(
+        max_concurrency=args.concurrency,
+        adaptive_search=args.adaptive,
+        max_domains=args.max_domains,
+    )
     report = await coordinator.run(topic=args.topic, doc_paths=args.docs)
 
     out_path = Path(args.output)
