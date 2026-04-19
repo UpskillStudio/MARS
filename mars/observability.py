@@ -1,16 +1,21 @@
 """
-Langfuse v4 observability via the @observe decorator pattern.
-Gracefully disabled if keys are not set.
+Langfuse observability for MARS.
 
-Usage in coordinator:
-    from mars.observability import observe_span
+Uses two complementary mechanisms:
+  1. AnthropicInstrumentor — auto-captures model name, token usage, and cost
+     on every client.messages.create call via OpenTelemetry.
+  2. @observe decorator — adds named span hierarchy for coordinator phases
+     (decompose, research, refinement, synthesis, report_gen).
 
-    @observe_span("decompose")
-    async def _decompose(self, topic): ...
+Both are gracefully disabled if LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY
+are not set.
+
+Usage:
+    from mars.observability import observe_span, observe_trace, flush
 """
 import os
 from functools import wraps
-from typing import Any, Callable
+from typing import Callable
 
 _enabled = False
 
@@ -22,16 +27,11 @@ def _init():
     if not pub or not sec:
         return
     try:
-        # Configure via env vars — Langfuse v4 reads these automatically
-        os.environ.setdefault("LANGFUSE_PUBLIC_KEY", pub)
-        os.environ.setdefault("LANGFUSE_SECRET_KEY", sec)
-        os.environ.setdefault(
-            "LANGFUSE_HOST",
-            os.getenv("LANGFUSE_HOST", "https://cloud.langfuse.com"),
-        )
-        from langfuse import observe  # noqa: F401 — verify importable
+        from langfuse import get_client, observe  # noqa: F401
+        from opentelemetry.instrumentation.anthropic import AnthropicInstrumentor
+        AnthropicInstrumentor().instrument()
         _enabled = True
-        print("[Observability] Langfuse v4 enabled")
+        print("[Observability] Langfuse enabled (Anthropic auto-instrumentation active)")
     except Exception as e:
         print(f"[Observability] Langfuse init failed (tracing disabled): {e}")
 
@@ -39,21 +39,24 @@ def _init():
 _init()
 
 
-def observe_span(name: str):
-    """
-    Decorator that wraps an async method as a Langfuse observed span.
-    No-op if Langfuse is not configured.
-    """
+def observe_trace(name: str):
+    """Decorator that marks an async method as the root Langfuse trace."""
     def decorator(fn: Callable):
         if not _enabled:
             return fn
         try:
-            from langfuse import observe
+            from langfuse import observe, get_client
 
             @observe(name=name)
             @wraps(fn)
-            async def wrapper(*args, **kwargs):
-                return await fn(*args, **kwargs)
+            async def wrapper(self, topic: str, **kwargs):
+                # Set explicit trace input — only the topic, not internal args
+                get_client().update_current_observation(input={"topic": topic})
+                result = await fn(self, topic, **kwargs)
+                get_client().update_current_observation(
+                    output={"chars": len(result) if isinstance(result, str) else 0}
+                )
+                return result
 
             return wrapper
         except Exception:
@@ -62,11 +65,8 @@ def observe_span(name: str):
     return decorator
 
 
-def observe_trace(name: str):
-    """
-    Decorator that marks an async method as the root Langfuse trace.
-    No-op if Langfuse is not configured.
-    """
+def observe_span(name: str):
+    """Decorator that wraps an async method as a named Langfuse span."""
     def decorator(fn: Callable):
         if not _enabled:
             return fn
@@ -86,7 +86,7 @@ def observe_trace(name: str):
 
 
 def flush():
-    """Flush pending events to Langfuse. Call at end of run."""
+    """Flush pending Langfuse events. Call at end of each run."""
     if not _enabled:
         return
     try:
