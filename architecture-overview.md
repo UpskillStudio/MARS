@@ -316,6 +316,68 @@ ReportGen Agent (Sonnet)
 
 ---
 
+## Search Modes — Direct vs Adaptive (ReAct)
+
+MARS exposes two search strategies selectable per run:
+
+| Mode | Default | Mechanism | When to use |
+|---|---|---|---|
+| **Direct** | Yes | Calls Tavily directly per sub-domain. No Haiku involved. | Most topics — fast, cheap (~$0.001/run) |
+| **Adaptive** | No (`--adaptive` / UI toggle) | Claude Haiku drives an iterative ReAct loop — refines queries based on what prior searches return | Niche/technical topics where initial query terms are imprecise |
+
+The ReAct cost comes entirely from Claude Haiku running the loop — not from Tavily. Each Haiku call is cheap individually, but a multi-turn ReAct loop across 5+ sub-domains accumulates. Direct mode eliminates all Haiku calls (~80% cost reduction) because Tavily already returns structured results well-suited for research topics.
+
+---
+
+## Observability — Langfuse Tracing
+
+Tracing is opt-in: set `LANGFUSE_PUBLIC_KEY` + `LANGFUSE_SECRET_KEY` in `.env` to enable.
+
+**Two complementary layers:**
+
+### Layer 1 — AnthropicInstrumentor (OpenTelemetry)
+```python
+from opentelemetry.instrumentation.anthropic import AnthropicInstrumentor
+AnthropicInstrumentor().instrument()
+```
+Automatically captures **model name, input/output tokens, and cost** on every `client.messages.create()` call — across all agents — without any changes to agent code. This is the framework integration approach recommended by Langfuse over manual instrumentation.
+
+### Layer 2 — `@observe` decorators (span hierarchy)
+```python
+@observe_trace("mars-run")      # root trace — sets input={topic}
+async def run(self, topic): ...
+
+@observe_span("decompose")
+async def _decompose(self): ...
+```
+Provides the named span hierarchy visible in Langfuse UI: `mars-run` → `decompose` → `research` → `refinement` → `synthesis` → `report_gen`. Shows which phase is slow or failing.
+
+**Fail-safe design:** Every decorator wraps execution in `try/except`. If Langfuse errors at runtime, a warning is logged and the original function runs directly. Langfuse outages never crash a research run.
+
+---
+
+## Streamlit UI (`app.py`)
+
+```bash
+streamlit run app.py
+```
+
+The UI runs the coordinator in a background thread (required because Streamlit's main thread is synchronous) and streams progress via a `queue.Queue`:
+
+```
+Thread: asyncio.run(coordinator.run()) → builtins.print → queue.put("log", msg)
+Main:   while thread.is_alive(): queue.get() → st.empty().code(logs)
+```
+
+**Sidebar controls:**
+- **Adaptive search toggle** — enables ReAct mode
+- **Max sub-domains slider** (2–9) — use 2–3 for cheap test runs
+- **File uploader** — `.txt`, `.md`, `.pdf` documents fed to DocAnalysis agent
+
+On completion: rendered markdown report + download button.
+
+---
+
 ## Key Design Decisions & Trade-offs
 
 | Decision | Alternative Considered | Reason Chosen |
@@ -327,3 +389,6 @@ ReportGen Agent (Sonnet)
 | `max_concurrency=1` default | Always parallel | Free-tier accounts hit 50k tokens/min; configurable for higher tiers |
 | Haiku for subagent loops | Sonnet everywhere | Subagent tasks are mechanical; Haiku is 10× cheaper with comparable tool-calling |
 | Vertical slice delivery | Build all layers then integrate | Real API feedback after every phase; problems surface early |
+| Direct Tavily search as default | ReAct as default | Eliminates all Haiku calls; ~80% cost reduction for most topics |
+| `AnthropicInstrumentor` for token tracing | Manual token logging | Auto-captures all agents with zero code changes; preferred over manual instrumentation |
+| Fail-safe Langfuse decorators | Let errors propagate | Observability must never degrade the research pipeline |

@@ -1,273 +1,206 @@
-# Multi Agent Research System
-# spec.md — Project Specification
+# Multi-Agent Research System
+# spec.md — As-Built Project Specification
+
+> This document reflects the system as implemented. The original preliminary spec has been superseded by `MARS-design.md` (design) and `architecture-overview.md` (implementation walkthrough).
 
 ---
 
 ## 1. Project Overview
 
-The **Multi Agent Research System** is a Python-based agentic AI platform that coordinates multiple specialized AI agents to perform deep, structured research tasks. Each agent is responsible for a distinct phase of the research pipeline — from topic decomposition and web search, to synthesis, citation, and final report generation. Agents communicate through a shared orchestration layer and produce structured, auditable outputs.
+MARS is a Python-based multi-agent AI platform that produces comprehensive, cited research reports on any topic. A coordinator agent orchestrates four specialized subagents — Web Search, Document Analysis, Synthesis, and Report Generation — in a hub-and-spoke topology. The system runs via CLI or Streamlit UI and is observable via Langfuse tracing.
 
 ---
 
-## 2. Goals
+## 2. Goals (as built)
 
-- [ ] Orchestrate multiple AI agents to collaboratively complete complex research tasks
-- [ ] Enable parallel and sequential agent execution based on task dependency graphs
-- [ ] Provide a reusable utility layer (`utils/`) shared across all agents
-- [ ] Store all research outputs, logs, and documentation under a structured `docs/` folder
-- [ ] Support extensibility — new agent types can be added without modifying core logic
-- [ ] Produce a final structured research report (Markdown + JSON) from every run
+- [x] Orchestrate multiple AI agents to collaboratively complete complex research tasks
+- [x] Enable parallel and sequential agent execution via `asyncio` + `Semaphore`
+- [x] Produce a final structured research report (Markdown) with inline citations and bibliography
+- [x] Support document ingestion (`--docs` flag / UI uploader) alongside web research
+- [x] Iterative gap-filling refinement: re-delegate until ≥2 sources per sub-domain
+- [x] Streamlit UI with live progress streaming
+- [x] Langfuse observability with token/cost tracking
 
-### Non-Goals
+### Non-Goals (still true)
 
-- This system is not a real-time chat interface
-- It does not manage user authentication or sessions
-- It does not provide a GUI (CLI and API only in v1)
+- Not a real-time chat interface
+- Does not manage user authentication or sessions
 
 ---
 
 ## 3. Technology Stack
 
-| Layer | Technology |
+| Layer | Technology | Notes |
+|---|---|---|
+| Language | Python 3.11+ | |
+| LLM SDK | `anthropic ≥ 0.40.0` | Async `AsyncAnthropic` client |
+| Web Search | `tavily-python ≥ 0.5.0` | AI-structured results; replaces DuckDuckGo from original spec |
+| HTTP | `httpx ≥ 0.27.0` | Async `fetch_url` tool |
+| Data Validation | `pydantic ≥ 2.7.0` | All inter-agent payloads are typed Pydantic models |
+| Config | `python-dotenv` | `.env` for API keys |
+| UI | `streamlit ≥ 1.35.0` | `app.py` — replaces CLI-only from original spec |
+| Observability | `langfuse ≥ 2.0.0` | Opt-in tracing; graceful no-op if keys absent |
+| OTel instrumentation | `opentelemetry-instrumentation-anthropic ≥ 0.60.0` | Auto-captures model, tokens, cost |
+| Testing | `pytest ≥ 8.0`, `pytest-asyncio ≥ 0.23` | |
+
+---
+
+## 4. Directory Structure (as built)
+
+```
+MARS/
+├── mars/
+│   ├── __init__.py
+│   ├── coordinator.py          # Coordinator — decompose, research, refine, synthesize, report
+│   ├── models.py               # All Pydantic models for inter-agent payloads
+│   ├── observability.py        # Langfuse tracing (fail-safe decorators + AnthropicInstrumentor)
+│   ├── agents/
+│   │   ├── __init__.py
+│   │   ├── web_search.py       # ReAct loop — web_search + fetch_url tools
+│   │   ├── doc_analysis.py     # ReAct loop — read_document + fetch_url tools
+│   │   ├── synthesis.py        # Synthesis — verify_fact tool
+│   │   └── report_gen.py       # Report generation — no tools (pure generation)
+│   └── tools/
+│       ├── __init__.py
+│       ├── web_search.py       # web_search (Tavily) + fetch_url (httpx)
+│       ├── document.py         # read_document — in-memory doc store
+│       └── verify_fact.py      # verify_fact — Tavily + Claude Haiku
+├── app.py                      # Streamlit UI
+├── main.py                     # CLI entry point
+├── pyproject.toml
+├── .env.example
+└── output/                     # Generated reports (gitignored)
+```
+
+---
+
+## 5. Agent Specifications (as built)
+
+### 5.1 Coordinator (`mars/coordinator.py`)
+
+- Model: `claude-sonnet-4-6`
+- Decomposes topic into ≥5 sub-domains via forced `tool_use` (structured JSON guaranteed)
+- Spawns subagents via `asyncio.gather()` + `Semaphore(max_concurrency)` — not LLM tool calls
+- Two search modes: **direct** (Tavily only, default) or **adaptive** (ReAct loop, opt-in)
+- Iterative refinement: re-delegates gaps until `ResearchManifest.coverage_sufficient()` == True
+- Instrumented with `@observe_trace("mars-run")` and per-phase `@observe_span` decorators
+
+### 5.2 Web Search Subagent (`mars/agents/web_search.py`)
+
+- Model: `claude-haiku-4-5-20251001`
+- Tools: `web_search`, `fetch_url`
+- ReAct loop: handles `tool_use` stop_reason, appends tool results, loops until `end_turn`
+- Retry: catches `RateLimitError`, backoff 10s → 20s → 40s, up to 3 retries
+- Returns: `list[Finding]`
+
+### 5.3 Document Analysis Subagent (`mars/agents/doc_analysis.py`)
+
+- Model: `claude-haiku-4-5-20251001`
+- Tools: `read_document`, `fetch_url`
+- Only activates when `--docs` / UI uploader provides documents
+- Returns: `list[DocFinding]`
+
+### 5.4 Synthesis Subagent (`mars/agents/synthesis.py`)
+
+- Model: `claude-sonnet-4-6`, max_tokens=8096
+- Tools: `verify_fact` (scoped — simple fact-checks only)
+- Returns: `SynthesisOutput {themes, conflicts, gaps, citations}`
+
+### 5.5 Report Generation Subagent (`mars/agents/report_gen.py`)
+
+- Model: `claude-sonnet-4-6`
+- No tools — pure generation from synthesis output
+- Returns: markdown string with inline `[Source N]` citations and bibliography
+
+---
+
+## 6. Data Models (`mars/models.py`)
+
+| Model | Key Fields |
 |---|---|
-| Language | Python 3.11+ |
-| AI / LLM | Anthropic Claude API (`anthropic` SDK) |
-| Web Search | `duckduckgo-search` or Anthropic web search tool |
-| Async Execution | `asyncio` + `aiohttp` |
-| Data Validation | `pydantic` v2 |
-| Config Management | `python-dotenv` + `pydantic-settings` |
-| Logging | Python `logging` (structured JSON logs) |
-| Testing | `pytest` + `pytest-asyncio` |
-| Dependency Management | `pip` + `requirements.txt` |
+| `Finding` | claim, evidence_excerpt, source_url, publication_date, relevance_score |
+| `DocFinding` | claim, evidence_excerpt, document_name, page_number, section |
+| `Theme` | title, summary, supporting_claims[], citations[] |
+| `Conflict` | description, positions[], citations[] |
+| `CoverageGap` | sub_domain, source_count, note |
+| `Citation` | source_url, title, publication_date, excerpt |
+| `SynthesisOutput` | themes[], conflicts[], gaps[], citations[] |
+| `ErrorResult` | isError, errorCategory, isRetryable, attemptedQuery, partialResults, message |
+| `SubDomainStatus` | name, source_count, findings[], doc_findings[] |
+| `ResearchManifest` | topic, sub_domains[], quality_threshold=2 |
+
+`ResearchManifest` helpers: `coverage_sufficient()` → bool, `gaps()` → list[SubDomainStatus]
 
 ---
 
-## 4. Folder Structure
+## 7. Observability (`mars/observability.py`)
 
-```
-multi_agent_research_system/
-│
-├── docs/                          # All documentation and research outputs
-│   ├── architecture.md            # System architecture overview
-│   ├── agent_specs.md             # Individual agent specifications
-│   ├── api_reference.md           # Internal API/interface reference
-│   └── outputs/                   # Generated research reports per run
-│       └── {run_id}/
-│           ├── report.md
-│           ├── citations.json
-│           └── run_log.json
-│
-├── agents/                        # Individual agent implementations
-│   ├── __init__.py
-│   ├── base_agent.py              # Abstract base class for all agents
-│   ├── orchestrator_agent.py      # Coordinates task delegation
-│   ├── research_agent.py          # Performs web search and data gathering
-│   ├── analysis_agent.py          # Synthesizes and cross-references findings
-│   ├── writer_agent.py            # Drafts final report sections
-│   └── citation_agent.py          # Validates and formats citations
-│
-├── utils/                         # Reusable shared components
-│   ├── __init__.py
-│   ├── llm_client.py              # Anthropic API wrapper (shared by all agents)
-│   ├── search_client.py           # Web search utility
-│   ├── prompt_builder.py          # Prompt templating and construction
-│   ├── task_queue.py              # Async task queue manager
-│   ├── logger.py                  # Structured logging utility
-│   ├── file_handler.py            # Read/write helpers for docs/outputs
-│   ├── validators.py              # Pydantic models for agent I/O validation
-│   └── config.py                  # Centralised config loading (.env)
-│
-├── tests/                         # Unit and integration tests
-│   ├── __init__.py
-│   ├── test_orchestrator.py
-│   ├── test_research_agent.py
-│   ├── test_analysis_agent.py
-│   ├── test_utils.py
-│   └── fixtures/
-│       └── sample_research_task.json
-│
-├── main.py                        # Entry point — CLI runner
-├── requirements.txt               # Python dependencies
-├── .env.example                   # Environment variable template
-├── CLAUDE.md                      # Claude Code instructions for this project
-└── README.md                      # Project overview and setup guide
-```
+Tracing is opt-in — set `LANGFUSE_PUBLIC_KEY` + `LANGFUSE_SECRET_KEY` in `.env`.
 
----
+| Layer | Mechanism | What it captures |
+|---|---|---|
+| LLM calls | `AnthropicInstrumentor` (OTel) | Model name, input/output tokens, cost — all agents, automatically |
+| Phase hierarchy | `@observe_trace` / `@observe_span` | `mars-run` → `decompose` → `research` → `refinement` → `synthesis` → `report_gen` |
 
-## 5. File Header Convention
-
-Every `.py` file in this project **must** include the following header comment block at the top:
-
-```python
-# ============================================================
-# Multi Agent Research System
-# ============================================================
-# File   : <filename>.py
-# Purpose: <one-line description>
-# ============================================================
-```
-
----
-
-## 6. Agent Specifications
-
-### 6.1 Base Agent (`agents/base_agent.py`)
-- Abstract class defining the `run(task: ResearchTask) -> AgentResult` interface
-- Holds reference to shared `LLMClient` and `Logger` from `utils/`
-- Provides retry logic and error handling hooks
-
-### 6.2 Orchestrator Agent (`agents/orchestrator_agent.py`)
-- Accepts a high-level research query from the user
-- Decomposes the query into a directed task graph
-- Assigns sub-tasks to specialist agents (Research, Analysis, Writer, Citation)
-- Aggregates outputs into a final result
-- Emits structured run logs to `docs/outputs/{run_id}/`
-
-### 6.3 Research Agent (`agents/research_agent.py`)
-- Receives a specific sub-topic or question
-- Uses `utils/search_client.py` to retrieve web sources
-- Summarises findings using the LLM
-- Returns structured `ResearchFindings` (Pydantic model)
-
-### 6.4 Analysis Agent (`agents/analysis_agent.py`)
-- Receives multiple `ResearchFindings` objects
-- Cross-references, identifies contradictions, and extracts key insights
-- Returns a structured `AnalysisSummary`
-
-### 6.5 Writer Agent (`agents/writer_agent.py`)
-- Takes an `AnalysisSummary` and writes a formatted report section
-- Follows a consistent Markdown report template
-- Returns a `ReportSection` object
-
-### 6.6 Citation Agent (`agents/citation_agent.py`)
-- Validates URLs and source metadata from `ResearchFindings`
-- Formats citations to a specified style (default: APA)
-- Returns a `CitationList`
-
----
-
-## 7. Reusable Utils (`utils/`) Specifications
-
-### `utils/llm_client.py`
-- Wraps `anthropic.Anthropic` client
-- Exposes `async def complete(prompt, system, model, max_tokens) -> str`
-- Handles rate limiting, retries (exponential backoff), and token tracking
-
-### `utils/search_client.py`
-- Wraps web search (DuckDuckGo or Anthropic tool-use search)
-- Exposes `async def search(query: str, num_results: int) -> list[SearchResult]`
-
-### `utils/prompt_builder.py`
-- Template-based prompt construction using Python f-strings or Jinja2
-- Loads templates from `utils/templates/` directory
-- Exposes `build_prompt(template_name, **kwargs) -> str`
-
-### `utils/task_queue.py`
-- Async FIFO task queue with priority support
-- Exposes `enqueue(task)`, `dequeue()`, `run_all()`
-
-### `utils/logger.py`
-- Structured JSON logger wrapping Python `logging`
-- Writes to stdout (dev) and `docs/outputs/{run_id}/run_log.json` (prod)
-
-### `utils/file_handler.py`
-- `save_report(run_id, content)` → saves to `docs/outputs/{run_id}/report.md`
-- `save_citations(run_id, citations)` → saves to `docs/outputs/{run_id}/citations.json`
-- `load_task(path)` → loads a research task from JSON file
-
-### `utils/validators.py`
-Pydantic v2 models:
-- `ResearchTask` — input schema
-- `ResearchFindings` — research agent output
-- `AnalysisSummary` — analysis agent output
-- `ReportSection` — writer agent output
-- `CitationList` — citation agent output
-- `AgentResult` — generic wrapper with status, data, errors
-
-### `utils/config.py`
-- Loads from `.env` using `pydantic-settings`
-- Exposes: `ANTHROPIC_API_KEY`, `DEFAULT_MODEL`, `MAX_TOKENS`, `LOG_LEVEL`, `OUTPUT_DIR`
+All decorators are fail-safe: runtime errors log a warning and fall back to the original function. Langfuse outages never crash a research run.
 
 ---
 
 ## 8. Data Flow
 
 ```
-User Input (CLI query)
+User input (topic + optional docs)
         ↓
-  OrchestratorAgent
-        ↓ decomposes into sub-tasks
-  ┌─────┬──────┬──────┐
-  ↓     ↓      ↓      ↓
-ResearchAgent × N  (parallel)
+Coordinator (Sonnet)
+  decompose_topic() → [{name, search_query, scope}, ...]
         ↓
-  AnalysisAgent    (sequential)
+  asyncio.gather() — max_concurrency=1 default (configurable)
+  ┌─────┴──────┬────────────────────┐
+  ▼            ▼                    ▼
+WebSearch    WebSearch    DocAnalysis (if docs provided)
+Agent #1     Agent #2     (Haiku, ReAct)
+  │            │
+  └─────┬──────┘
+        ▼
+  ResearchManifest → gap check → re-delegate if needed (ToT)
+        ▼
+Synthesis Agent (Sonnet) → SynthesisOutput
+        ▼
+ReportGen Agent (Sonnet) → Markdown report
         ↓
-  WriterAgent      (sequential)
-        ↓
-  CitationAgent    (sequential)
-        ↓
-  Final Report → docs/outputs/{run_id}/
+  output/report.md
 ```
 
 ---
 
-## 9. Entry Point (`main.py`)
+## 9. Running the System
 
-```
-Usage:
-  python main.py --query "Impact of LLMs on scientific research" --output-dir docs/outputs/
-  python main.py --task-file tests/fixtures/sample_research_task.json
-```
+```bash
+# Setup
+cp .env.example .env        # fill in ANTHROPIC_API_KEY, TAVILY_API_KEY
+pip install -e .
 
-CLI arguments:
-- `--query` — free-text research question
-- `--task-file` — path to a pre-defined JSON task file
-- `--model` — Claude model to use (default: `claude-sonnet-4-20250514`)
-- `--output-dir` — override default output directory
-- `--log-level` — DEBUG / INFO / WARNING (default: INFO)
+# Streamlit UI (recommended)
+streamlit run app.py
 
----
-
-## 10. Environment Variables (`.env.example`)
-
-```
-ANTHROPIC_API_KEY=your_api_key_here
-DEFAULT_MODEL=claude-sonnet-4-20250514
-MAX_TOKENS=4096
-LOG_LEVEL=INFO
-OUTPUT_DIR=docs/outputs
+# CLI
+python main.py --topic "impact of AI on creative industries"
+python main.py --topic "quantum computing" --docs paper.pdf
+python main.py --topic "AI ethics" --adaptive          # ReAct search mode
+python main.py --topic "quick test" --max-domains 2    # cheap 2-domain run
+python main.py --topic "AI" --concurrency 3            # parallel (higher-tier accounts)
 ```
 
 ---
 
-## 11. Testing Requirements
+## 10. Environment Variables
 
-- All `utils/` modules must have unit tests in `tests/test_utils.py`
-- Each agent must have at least one integration test using mocked LLM responses
-- Use `pytest-asyncio` for all async tests
-- Minimum 80% code coverage target
+```
+ANTHROPIC_API_KEY=sk-ant-...          # required
+TAVILY_API_KEY=tvly-...               # required
 
----
-
-## 12. Coding Conventions
-
-- All files begin with the standard file header (see Section 5)
-- Use `async/await` for all I/O-bound operations
-- All agent inputs/outputs validated with Pydantic models
-- No hardcoded API keys or secrets — always load from `config.py`
-- Docstrings required on all public classes and functions (Google style)
-- Type hints required on all function signatures
-
----
-
-## 13. CLAUDE.md Instructions Reference
-
-When using Claude Code in VS Code, Claude should:
-1. Always read `spec.md` before starting any task
-2. Place all reusable components in `utils/`
-3. Store documentation and outputs in `docs/`
-4. Add the standard file header to every `.py` file created
-5. Follow async patterns defined in `utils/task_queue.py`
-6. Validate all agent I/O against Pydantic models in `utils/validators.py`
+# Optional — Langfuse observability
+LANGFUSE_PUBLIC_KEY=pk-lf-...
+LANGFUSE_SECRET_KEY=sk-lf-...
+LANGFUSE_HOST=https://cloud.langfuse.com
+```
