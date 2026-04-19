@@ -47,16 +47,20 @@ def observe_trace(name: str):
         try:
             from langfuse import observe, get_client
 
-            @observe(name=name)
+            _traced = observe(name=name)(fn)
+
             @wraps(fn)
             async def wrapper(self, topic: str, **kwargs):
-                # Set explicit trace input — only the topic, not internal args/keys
-                get_client().set_current_trace_io(input={"topic": topic})
-                result = await fn(self, topic, **kwargs)
-                get_client().set_current_trace_io(
-                    output={"chars": len(result) if isinstance(result, str) else 0}
-                )
-                return result
+                try:
+                    get_client().set_current_trace_io(input={"topic": topic})
+                    result = await _traced(self, topic, **kwargs)
+                    get_client().set_current_trace_io(
+                        output={"chars": len(result) if isinstance(result, str) else 0}
+                    )
+                    return result
+                except Exception as e:
+                    print(f"[Observability] trace error (bypassing tracing): {e}")
+                    return await fn(self, topic, **kwargs)
 
             return wrapper
         except Exception:
@@ -73,10 +77,15 @@ def observe_span(name: str):
         try:
             from langfuse import observe
 
-            @observe(name=name)
+            _traced = observe(name=name)(fn)
+
             @wraps(fn)
             async def wrapper(*args, **kwargs):
-                return await fn(*args, **kwargs)
+                try:
+                    return await _traced(*args, **kwargs)
+                except Exception as e:
+                    print(f"[Observability] span error (bypassing tracing): {e}")
+                    return await fn(*args, **kwargs)
 
             return wrapper
         except Exception:
