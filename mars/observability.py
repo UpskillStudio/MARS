@@ -50,10 +50,10 @@ def observe_trace(name: str):
             @observe(name=name)
             @wraps(fn)
             async def wrapper(self, topic: str, **kwargs):
-                # Set explicit trace input — only the topic, not internal args
-                get_client().update_current_observation(input={"topic": topic})
+                # Set explicit trace input — only the topic, not internal args/keys
+                get_client().set_current_trace_io(input={"topic": topic})
                 result = await fn(self, topic, **kwargs)
-                get_client().update_current_observation(
+                get_client().set_current_trace_io(
                     output={"chars": len(result) if isinstance(result, str) else 0}
                 )
                 return result
